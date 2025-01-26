@@ -1,113 +1,105 @@
+import { action } from "@ember/object";
 import { setOwner } from "@ember/owner";
-import { later, schedule } from "@ember/runloop";
 import { withPluginApi } from "discourse/lib/plugin-api";
-import { observes, on } from "discourse-common/utils/decorators";
 
 class OmitEmojiInit {
   constructor(owner, api) {
     setOwner(this, owner);
 
-    const emoji = settings.omitted_emoji.split("|");
-    const emojiGroups = settings.omitted_emoji_groups.split("|");
+    const omittedEmojis = settings.omitted_emoji.split("|").filter(Boolean);
+    const omittedEmojiGroups = settings.omitted_emoji_groups
+      .split("|")
+      .filter(Boolean);
 
-    api.modifyClass("component:emoji-picker", {
-      pluginId: "omit-emoji",
+    api.modifyClass(
+      "component:emoji-picker/content",
+      (Superclass) =>
+        class extends Superclass {
+          get groups() {
+            const groups = super.groups;
 
-      @on("init")
-      omitFromRecent() {
-        let favorites = this.emojiStore.favorites;
-        emoji.forEach((e) => {
-          favorites = favorites.filter((f) => f !== e);
-        });
-        this.emojiStore.favorites = favorites;
-      },
+            if (!omittedEmojiGroups.length && !omittedEmojis.length) {
+              return groups;
+            }
 
-      @observes("isActive")
-      omitEmoji() {
-        // Remove Emoji group buttons
-        emojiGroups.forEach((eg) => {
-          const emojiGroup = document.querySelector(
-            `.category-button[data-section="${eg}"]`
-          );
-          if (emojiGroup) {
-            emojiGroup.remove();
+            const updatedGroups = Object.fromEntries(
+              Object.entries(groups)
+                .map(([key, emojis]) => {
+                  if (
+                    omittedEmojiGroups.length &&
+                    omittedEmojiGroups.includes(key)
+                  ) {
+                    return null;
+                  }
+                  if (omittedEmojis.length) {
+                    emojis = emojis.filter(
+                      (emoji) => !omittedEmojis.includes(emoji.name)
+                    );
+                  }
+                  return [key, emojis];
+                })
+                .filter(Boolean)
+            );
+
+            return updatedGroups;
           }
-        });
 
-        // Remove emoji and groups from unfiltered list. Fires after core:
-        // https://github.com/discourse/discourse/blob/fc30669db27c20ebbb8056c488656deb1f066efd/app/assets/javascripts/discourse/app/components/emoji-picker.js#L133-L152
-        later(() => {
-          schedule("afterRender", () => {
-            emojiGroups.forEach((eg) => {
-              const emojiGroup = document.querySelector(
-                `.section[data-section="${eg}"]`
-              );
-              if (emojiGroup) {
-                emojiGroup.remove();
-              }
-            });
-            emoji.forEach((e) => {
-              const emoji = document.querySelector(`img.emoji[title="${e}"]`);
-              if (emoji) {
-                emoji.remove();
-              }
-            });
-          });
-        }, 60);
+          get flatEmojis() {
+            const list = super.flatEmojis;
 
-        // Remove emoji from filtered list. A class is added when the list is filtered so we can observe it.
-        const classObserver = new MutationObserver((mutationsList) => {
-          mutationsList.forEach((m) => {
-            if (m.attributeName === "class") {
-              emoji.forEach((e) => {
-                const emoji = document.querySelector(`img.emoji[title="${e}"]`);
-                if (emoji) {
-                  emoji.remove();
+            return omittedEmojis.length
+              ? list.filter((emoji) => !omittedEmojis.includes(emoji.name))
+              : list;
+          }
+        }
+    );
+
+    api.modifyClass(
+      "component:d-editor",
+      (Superclass) =>
+        class extends Superclass {
+          @action
+          setupEditor(textManipulation) {
+            const originalCleanup = super.setupEditor(textManipulation);
+            const textareaWrapper = document.querySelector(
+              ".d-editor-textarea-wrapper"
+            );
+
+            if (!textareaWrapper || !omittedEmojis.length) {
+              return originalCleanup;
+            }
+
+            const childListObserver = new MutationObserver((mutationsList) => {
+              mutationsList.forEach((mutation) => {
+                const node = mutation.addedNodes[0];
+                if (
+                  node?.classList?.contains("autocomplete") &&
+                  node?.classList?.contains("ac-emoji")
+                ) {
+                  omittedEmojis.forEach((emojiCode) => {
+                    const emojiElement = node.querySelector(
+                      `img.emoji[src*="${emojiCode}.png"]`
+                    );
+
+                    if (emojiElement) {
+                      emojiElement.parentNode.parentNode.style.display = "none";
+                    }
+                  });
                 }
               });
-            }
-          });
-        });
+            });
 
-        const emojiPicker = document.querySelector(".emoji-picker");
-        if (emojiPicker) {
-          classObserver.observe(emojiPicker, { attributes: true });
+            childListObserver.observe(textareaWrapper, {
+              childList: true,
+            });
+
+            return () => {
+              originalCleanup?.();
+              childListObserver?.disconnect();
+            };
+          }
         }
-      },
-    });
-
-    api.modifyClass("component:d-editor", {
-      pluginId: "omit-emoji",
-      @on("didInsertElement")
-      omitEmojiAutocomplete() {
-        const childListObserver = new MutationObserver((mutationsList) => {
-          mutationsList.forEach((m) => {
-            const nodes = m.addedNodes[0];
-            if (
-              nodes &&
-              nodes.classList &&
-              nodes.classList.value === "autocomplete ac-emoji"
-            ) {
-              emoji.forEach((e) => {
-                const emoji = document.querySelector(
-                  `img.emoji[src*="${e}.png"]`
-                );
-                if (emoji) {
-                  emoji.parentNode.parentNode.remove();
-                }
-              });
-            }
-          });
-        });
-
-        const textareaWrapper = document.querySelector(
-          ".d-editor-textarea-wrapper"
-        );
-        if (textareaWrapper) {
-          childListObserver.observe(textareaWrapper, { childList: true });
-        }
-      },
-    });
+    );
   }
 }
 
@@ -115,7 +107,7 @@ export default {
   name: "discourse-omit-emoji",
 
   initialize(owner) {
-    withPluginApi("0.8.25", (api) => {
+    withPluginApi("0.35.0", (api) => {
       this.instance = new OmitEmojiInit(owner, api);
     });
   },
